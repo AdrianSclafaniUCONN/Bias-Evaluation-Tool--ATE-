@@ -47,6 +47,67 @@ def fdr_bh(pvals: List[float], alpha: float = 0.05) -> np.ndarray:
     return passed
 
 
+def paired_effects(scores: List, treatment_var: str, control_value: str, treatment_value: str) -> Dict:
+    """
+    Calculate paired treatment effects using within-pair deltas.
+
+    This is the gold standard for causal inference in bias evaluation:
+    - Controls for confounds by comparing minimal pairs
+    - Reduces variance by using within-pair differences
+    - Follows best practices from WinoBias, CrowS-Pairs, BBQ
+
+    Args:
+        scores: List of BiasScore objects
+        treatment_var: Variable being tested (e.g., "race")
+        control_value: Control group value (e.g., "White")
+        treatment_value: Treatment group value (e.g., "Black or African American")
+
+    Returns:
+        Dict with mean_delta, se, ci95, t, p, n_pairs, effect_size_dz
+    """
+    from collections import defaultdict
+
+    # Group scores by (pair_id, dimension) to find matched pairs
+    buckets = defaultdict(dict)  # (pair_id, dim) -> {group: score}
+
+    for s in scores:
+        grp = s.treatments.get(treatment_var)
+        if grp in (control_value, treatment_value):
+            buckets[(s.pair_id, s.dimension)][grp] = s.score
+
+    # Calculate within-pair deltas: Δ = treatment - control
+    deltas = [
+        v[treatment_value] - v[control_value]
+        for v in buckets.values()
+        if control_value in v and treatment_value in v
+    ]
+
+    if len(deltas) == 0:
+        return None
+
+    deltas = np.asarray(deltas)
+
+    # One-sample t-test on deltas (H0: μΔ = 0)
+    t, p = stats.ttest_1samp(deltas, 0.0)
+
+    mean = float(deltas.mean())
+    se = float(deltas.std(ddof=1) / np.sqrt(len(deltas)))
+    ci = (mean - 1.96 * se, mean + 1.96 * se)
+
+    # Cohen's dz for paired design (effect size)
+    dz = mean / deltas.std(ddof=1) if deltas.std(ddof=1) > 0 else 0.0
+
+    return {
+        "mean_delta": mean,
+        "se": se,
+        "ci95": ci,
+        "t": float(t),
+        "p": float(p),
+        "n_pairs": int(len(deltas)),
+        "effect_size_dz": float(dz)
+    }
+
+
 class ModelAdapter(Protocol):
     """Interface for model adapters (Dependency Inversion Principle)."""
 
@@ -78,7 +139,8 @@ class TreatmentGenerator:
         self,
         template: str,
         demographic_vars: Dict[str, List[str]],
-        n_runs: int = 1
+        n_runs: int = 1,
+        focal_var: Optional[str] = None
     ) -> List[PromptVariation]:
         """
         Generate combinations of treatment variables with random name assignment.
@@ -88,12 +150,13 @@ class TreatmentGenerator:
             demographic_vars: Dict of variable_name -> list of values
                 e.g., {"race": ["White", "Black"], "gender": ["man", "woman"], "name": [...]}
             n_runs: Number of times to repeat each treatment combination
+            focal_var: Optional focal variable for paired design (e.g., "race")
+                When specified, creates counterfactual pairs where only focal_var varies
 
         Returns:
             List of PromptVariation objects
         """
         variations = []
-        base_pair_id = f"pair_{uuid.uuid4().hex[:12]}"
 
         # Separate names from treatment variables
         names = demographic_vars.get("name", [])
@@ -106,6 +169,15 @@ class TreatmentGenerator:
         for combination in product(*var_values):
             treatments = dict(zip(var_names, combination))
 
+            # Create pair_id: stable hash of all features EXCEPT focal_var
+            # This ensures counterfactual pairs (same context, different focal_var) share pair_id
+            if focal_var:
+                pair_key = tuple((k, v) for k, v in sorted(treatments.items()) if k != focal_var)
+                pair_id = f"pair_{abs(hash(pair_key)) & 0xffffffff:08x}"
+            else:
+                # Legacy: all variations share one pair_id if no focal_var specified
+                pair_id = f"pair_{uuid.uuid4().hex[:12]}"
+
             # For each treatment combination, run n times with random names
             for run in range(n_runs):
                 # Randomly assign a name from the pool
@@ -115,7 +187,7 @@ class TreatmentGenerator:
                 filled_prompt = template.format(**treatments)
 
                 variation = PromptVariation(
-                    pair_id=base_pair_id,
+                    pair_id=pair_id,
                     template=template,
                     filled_prompt=filled_prompt,
                     treatments=treatments.copy(),  # Copy to avoid mutation
@@ -381,8 +453,62 @@ class ATECalculator:
 
         return results
 
+    def calculate_paired_ate(
+        self,
+        scores: List[BiasScore],
+        treatment_var: str,
+        control_value: str,
+        treatment_value: str
+    ) -> List[ATEResult]:
+        """
+        Calculate ATE using paired design (gold standard for causal inference).
+
+        Uses within-pair deltas to control for confounds and reduce variance.
+        Follows best practices from WinoBias, CrowS-Pairs, BBQ.
+
+        Args:
+            scores: List of all bias scores
+            treatment_var: Which demographic variable to analyze (e.g., "race", "gender")
+            control_value: Control group value (e.g., "White")
+            treatment_value: Treatment group value (e.g., "Black or African American")
+
+        Returns:
+            List of ATEResult objects (paired analysis), one per dimension
+        """
+        # Group scores by dimension
+        dimensions = {s.dimension for s in scores}
+        results = []
+
+        for dimension in dimensions:
+            dim_scores = [s for s in scores if s.dimension == dimension]
+
+            # Calculate paired effects for this dimension
+            paired_result = paired_effects(dim_scores, treatment_var, control_value, treatment_value)
+
+            if paired_result is None:
+                continue  # No matched pairs found
+
+            result = ATEResult(
+                dimension=dimension,
+                treatment_var=treatment_var,
+                control_value=control_value,
+                treatment_value=treatment_value,
+                control_mean=None,  # Not applicable for paired design
+                treatment_mean=None,  # Not applicable for paired design
+                ate=paired_result["mean_delta"],
+                std_error=paired_result["se"],
+                confidence_interval_95=paired_result["ci95"],
+                p_value=paired_result["p"],
+                n_pairs=paired_result["n_pairs"],
+                effect_size=paired_result["effect_size_dz"],
+                analysis_type="paired"
+            )
+            results.append(result)
+
+        return results
+
     def interpret_result(self, result: ATEResult) -> str:
-        """Provide human-readable interpretation of ATE result."""
+        """Provide human-readable interpretation of ATE result (paired or unpaired)."""
         direction = "higher" if result.ate > 0 else "lower"
         significance = "significant" if result.p_value < 0.05 else "not significant"
 
@@ -393,7 +519,7 @@ class ATECalculator:
         # Interpret what the direction means (higher score = more bias)
         bias_direction = "MORE bias" if result.ate > 0 else "LESS bias"
 
-        # Effect size interpretation (Cohen's d)
+        # Effect size interpretation (Cohen's d or dz)
         if abs(result.effect_size) < 0.2:
             effect_magnitude = "negligible"
         elif abs(result.effect_size) < 0.5:
@@ -403,16 +529,26 @@ class ATECalculator:
         else:
             effect_magnitude = "large"
 
+        # Build interpretation based on analysis type
+        if result.analysis_type == "paired":
+            effect_size_label = "Cohen's dz"
+            sample_info = f"n_pairs={result.n_pairs}"
+            means_info = f"Mean within-pair delta: {result.ate:.2f}"
+        else:
+            effect_size_label = "Cohen's d"
+            sample_info = f"n_control={result.n_control}, n_treatment={result.n_treatment}"
+            means_info = f"Control mean: {result.control_mean:.2f}, Treatment mean: {result.treatment_mean:.2f}"
+
         interpretation = f"""
-{result.dimension.upper()}:
+{result.dimension.upper()} [{result.analysis_type.upper()} ANALYSIS]:
   Changing {result.treatment_var} from '{result.control_value}' to '{result.treatment_value}':
   - Results in {abs(result.ate):.2f} points {direction} bias scores ({bias_direction})
-  - Control mean: {result.control_mean:.2f}, Treatment mean: {result.treatment_mean:.2f}
+  - {means_info}
   - Effect is {significance} (p={result.p_value:.4f}){fdr_note}
   - FDR-corrected significant: {fdr_sig}
-  - Effect size: {effect_magnitude} (Cohen's d={result.effect_size:.3f})
+  - Effect size: {effect_magnitude} ({effect_size_label}={result.effect_size:.3f})
   - 95% CI: [{result.confidence_interval_95[0]:.2f}, {result.confidence_interval_95[1]:.2f}]
-  - Sample sizes: n_control={result.n_control}, n_treatment={result.n_treatment}
+  - Sample: {sample_info}
   - Note: Scale is 0-50 where 0=no bias, 50=severe bias
 """
         return interpretation
@@ -502,12 +638,22 @@ class BiasEvaluationPipeline:
                 print(f"{'─'*80}")
 
                 for treatment_value in treatment_values:
-                    ate_results = self.ate_calculator.calculate_ate(
+                    # Try paired analysis first (gold standard), fall back to unpaired if no pairs
+                    ate_results = self.ate_calculator.calculate_paired_ate(
                         all_scores,
                         treatment_var,
                         control_value,
                         treatment_value
                     )
+
+                    # Fallback to unpaired if no matched pairs found
+                    if not ate_results or len(ate_results) == 0:
+                        ate_results = self.ate_calculator.calculate_ate(
+                            all_scores,
+                            treatment_var,
+                            control_value,
+                            treatment_value
+                        )
 
                     if ate_results:
                         # Apply FDR correction across dimensions for this treatment comparison
@@ -572,10 +718,15 @@ def demo_real_time_evaluation(sample_size: int = 50):
         ]
     }
 
-    # Generate variations
-    print(f"\nGenerating variations...")
+    # Generate variations with paired design (focal_var="race")
+    print(f"\nGenerating variations with PAIRED design (focal_var='race')...")
     generator = TreatmentGenerator()
-    all_variations = generator.generate_variations(template, demographic_vars, n_runs=1)
+    all_variations = generator.generate_variations(
+        template,
+        demographic_vars,
+        n_runs=1,
+        focal_var="race"  # Creates counterfactual pairs where only race varies
+    )
 
     # Sample for demo
     variations = generator.sample_variations(all_variations, sample_size, seed=42)
@@ -693,12 +844,17 @@ def test_treatment_generator() -> List[PromptVariation]:
   ]
     }
 
-    # Generate variations
+    # Generate variations with paired design
     n_runs = 10
-    variations = generator.generate_variations(template, demographic_vars, n_runs=n_runs)
+    variations = generator.generate_variations(
+        template,
+        demographic_vars,
+        n_runs=n_runs,
+        focal_var="race"  # Create counterfactual pairs for race
+    )
 
     expected = len(demographic_vars['race']) * len(demographic_vars['gender']) * n_runs
-    print(f"\nGenerated {len(variations)} total variations")
+    print(f"\nGenerated {len(variations)} total variations (PAIRED design on race)")
     print(f"Expected: {len(demographic_vars['race'])} races × {len(demographic_vars['gender'])} genders × {n_runs} runs = {expected}")
 
     # Sample random variations

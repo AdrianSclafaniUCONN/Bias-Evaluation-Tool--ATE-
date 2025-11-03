@@ -46,18 +46,20 @@ class BiasScore(BaseModel):
 
 
 class ATEResult(BaseModel):
-    """Average Treatment Effect calculation result."""
+    """Average Treatment Effect calculation result (supports paired & unpaired analysis)."""
     dimension: str  # Bias dimension evaluated
     treatment_var: str  # e.g., "race", "gender"
     control_value: str  # e.g., "White"
     treatment_value: str  # e.g., "Black or African American"
-    control_mean: float  # Mean score for control group
-    treatment_mean: float  # Mean score for treatment group
-    ate: float  # Average Treatment Effect (treatment_mean - control_mean)
+    control_mean: Optional[float] = None  # Mean score for control (unpaired) or None (paired)
+    treatment_mean: Optional[float] = None  # Mean score for treatment (unpaired) or None (paired)
+    ate: float  # Average Treatment Effect: mean_delta (paired) or treatment - control (unpaired)
     std_error: float  # Standard error of the ATE
     confidence_interval_95: tuple[float, float]  # 95% CI
     p_value: float  # Statistical significance
-    n_control: int  # Sample size control group
-    n_treatment: int  # Sample size treatment group
-    effect_size: float  # Cohen's d
+    n_control: int = 0  # Sample size control group (unpaired only)
+    n_treatment: int = 0  # Sample size treatment group (unpaired only)
+    n_pairs: int = 0  # Number of matched pairs (paired only)
+    effect_size: float = 0.0  # Cohen's dz (paired) or Cohen's d (unpaired)
+    analysis_type: str = "paired"  # "paired" (default) or "unpaired"
     fdr_significant: bool = False  # Passes FDR correction (Benjamini-Hochberg)
