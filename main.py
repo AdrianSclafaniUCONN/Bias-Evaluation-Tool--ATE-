@@ -5,6 +5,8 @@ import os
 import json
 import random
 import uuid
+import time
+import hashlib
 from typing import Protocol, Optional, Dict, List
 from itertools import product
 from collections import defaultdict
@@ -117,19 +119,53 @@ class ModelAdapter(Protocol):
 
 
 class OpenAIAdapter:
-    """OpenAI implementation of ModelAdapter."""
+    """OpenAI implementation of ModelAdapter with retry logic and JSON enforcement."""
 
-    def __init__(self, model: str = "gpt-5-nano", api_key: Optional[str] = None):
+    def __init__(
+        self,
+        model: str = "gpt-5-nano",
+        api_key: Optional[str] = None,
+        enforce_json: bool = False,
+        temperature: Optional[float] = None
+    ):
         self.model = model
         self.client = OpenAI(api_key=api_key or os.getenv("OPENAI_API_KEY"))
+        self.enforce_json = enforce_json
+        self.temperature = temperature  # None means use model default
 
     def generate(self, prompt: str) -> str:
-        """Generate a response using OpenAI API."""
-        response = self.client.chat.completions.create(
-            model=self.model,
-            messages=[{"role": "user", "content": prompt}]
-        )
-        return response.choices[0].message.content
+        """
+        Generate a response using OpenAI API with retry/backoff.
+
+        Args:
+            prompt: The prompt to send to the model
+
+        Returns:
+            Model response text
+        """
+        for attempt in range(3):
+            try:
+                kwargs = {
+                    "model": self.model,
+                    "messages": [{"role": "user", "content": prompt}]
+                }
+
+                # Only set temperature if explicitly provided
+                if self.temperature is not None:
+                    kwargs["temperature"] = self.temperature
+
+                # Enforce JSON structure for judge models
+                if self.enforce_json:
+                    kwargs["response_format"] = {"type": "json_object"}
+
+                response = self.client.chat.completions.create(**kwargs)
+                return response.choices[0].message.content
+
+            except Exception as e:
+                if attempt == 2:  # Last attempt
+                    raise
+                # Exponential backoff: 0.5s, 1s, 2s
+                time.sleep(0.5 * (2 ** attempt))
 
 
 class TreatmentGenerator:
@@ -173,24 +209,34 @@ class TreatmentGenerator:
             # This ensures counterfactual pairs (same context, different focal_var) share pair_id
             if focal_var:
                 pair_key = tuple((k, v) for k, v in sorted(treatments.items()) if k != focal_var)
-                pair_id = f"pair_{abs(hash(pair_key)) & 0xffffffff:08x}"
+                # Use hashlib for deterministic cross-process hashing
+                pair_id = f"pair_{hashlib.sha1(repr(pair_key).encode()).hexdigest()[:12]}"
+
+                # Lock a name per pair_id to prevent name leakage between counterfactuals
+                if names:
+                    rng = random.Random(pair_id)  # deterministic per pair
+                    locked_name = rng.choice(names)
             else:
                 # Legacy: all variations share one pair_id if no focal_var specified
                 pair_id = f"pair_{uuid.uuid4().hex[:12]}"
+                locked_name = None
 
-            # For each treatment combination, run n times with random names
+            # For each treatment combination, run n times
             for run in range(n_runs):
-                # Randomly assign a name from the pool
-                if names:
-                    treatments["name"] = random.choice(names)
+                t = treatments.copy()
 
-                filled_prompt = template.format(**treatments)
+                # Assign name: locked for paired design, random for unpaired
+                if names:
+                    t["name"] = locked_name if focal_var else random.choice(names)
+
+                filled_prompt = template.format(**t)
 
                 variation = PromptVariation(
+                    variation_id=f"var_{uuid.uuid4().hex[:12]}",  # Always set variation_id
                     pair_id=pair_id,
                     template=template,
                     filled_prompt=filled_prompt,
-                    treatments=treatments.copy(),  # Copy to avoid mutation
+                    treatments=t,
                     run_number=run + 1
                 )
                 variations.append(variation)
@@ -427,12 +473,13 @@ class ATECalculator:
             ci_lower = ate - ci_margin
             ci_upper = ate + ci_margin
 
-            # Calculate Cohen's d (effect size)
+            # Calculate Cohen's d (effect size) - guard for zero variance
             pooled_variance = (
                 (len(control_scores) - 1) * np.var(control_scores, ddof=1) +
                 (len(treatment_scores) - 1) * np.var(treatment_scores, ddof=1)
             ) / (len(control_scores) + len(treatment_scores) - 2)
-            cohens_d = ate / np.sqrt(pooled_variance)
+            denom = np.sqrt(pooled_variance) if pooled_variance > 0 else 1e-9
+            cohens_d = ate / denom
 
             result = ATEResult(
                 dimension=dimension,
@@ -447,7 +494,8 @@ class ATECalculator:
                 p_value=float(p_value),
                 n_control=len(control_scores),
                 n_treatment=len(treatment_scores),
-                effect_size=float(cohens_d)
+                effect_size=float(cohens_d),
+                analysis_type="unpaired"  # Mark as unpaired
             )
             results.append(result)
 
@@ -726,9 +774,13 @@ def demo_real_time_evaluation(
         ]
     }
 
+    # Set deterministic seeds for reproducibility
+    random.seed(42)
+    np.random.seed(42)
+
     generator = TreatmentGenerator()
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
-    judge_adapter = OpenAIAdapter(model="gpt-5-nano")
+    judge_adapter = OpenAIAdapter(model="gpt-5-nano", enforce_json=True)  # JSON enforcement for judges
     pipeline = BiasEvaluationPipeline(
         model_adapter=model_adapter,
         judge_adapter=judge_adapter,
@@ -869,7 +921,7 @@ def test_bias_judge(variations: List[PromptVariation]):
 
     # Step 3: Judge the response on all bias dimensions
     print(f"\nJudging response on all 5 bias dimensions...")
-    judge_adapter = OpenAIAdapter(model="gpt-5-nano")
+    judge_adapter = OpenAIAdapter(model="gpt-5-nano", enforce_json=True)
     judge = BiasJudge(judge_adapter)
 
     scores = judge.score_all_dimensions(model_response)
