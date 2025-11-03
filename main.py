@@ -18,6 +18,35 @@ from models import ModelResponse, PromptVariation, BiasScore, ATEResult
 load_dotenv()
 
 
+def fdr_bh(pvals: List[float], alpha: float = 0.05) -> np.ndarray:
+    """
+    Benjamini-Hochberg FDR correction for multiple testing.
+
+    Args:
+        pvals: List of p-values to correct
+        alpha: Significance level (default 0.05)
+
+    Returns:
+        Boolean array indicating which tests pass FDR correction
+    """
+    p = np.asarray(pvals)
+    m = len(p)
+    order = np.argsort(p)
+    ranked = p[order]
+    thresh = alpha * (np.arange(1, m + 1) / m)
+
+    # Find highest index where p <= threshold
+    passed_indices = np.where(ranked <= thresh)[0]
+    cutoff = np.max(passed_indices) if len(passed_indices) > 0 else -1
+
+    # Mark all tests up to cutoff as significant
+    passed = np.zeros(m, dtype=bool)
+    if cutoff >= 0:
+        passed[order[:cutoff + 1]] = True
+
+    return passed
+
+
 class ModelAdapter(Protocol):
     """Interface for model adapters (Dependency Inversion Principle)."""
 
@@ -311,8 +340,8 @@ class ATECalculator:
             # Calculate ATE (treatment - control)
             ate = treatment_mean - control_mean
 
-            # Perform independent samples t-test
-            t_stat, p_value = stats.ttest_ind(treatment_scores, control_scores)
+            # Perform Welch's t-test (robust to unequal variances & sample sizes)
+            t_stat, p_value = stats.ttest_ind(treatment_scores, control_scores, equal_var=False)
 
             # Calculate standard error and confidence interval
             pooled_std = np.sqrt(
@@ -357,6 +386,10 @@ class ATECalculator:
         direction = "higher" if result.ate > 0 else "lower"
         significance = "significant" if result.p_value < 0.05 else "not significant"
 
+        # FDR-corrected significance (Benjamini-Hochberg)
+        fdr_sig = "YES" if result.fdr_significant else "NO"
+        fdr_note = " (survives FDR correction)" if result.fdr_significant else " (does not survive FDR correction)"
+
         # Interpret what the direction means (higher score = more bias)
         bias_direction = "MORE bias" if result.ate > 0 else "LESS bias"
 
@@ -375,7 +408,8 @@ class ATECalculator:
   Changing {result.treatment_var} from '{result.control_value}' to '{result.treatment_value}':
   - Results in {abs(result.ate):.2f} points {direction} bias scores ({bias_direction})
   - Control mean: {result.control_mean:.2f}, Treatment mean: {result.treatment_mean:.2f}
-  - Effect is {significance} (p={result.p_value:.4f})
+  - Effect is {significance} (p={result.p_value:.4f}){fdr_note}
+  - FDR-corrected significant: {fdr_sig}
   - Effect size: {effect_magnitude} (Cohen's d={result.effect_size:.3f})
   - 95% CI: [{result.confidence_interval_95[0]:.2f}, {result.confidence_interval_95[1]:.2f}]
   - Sample sizes: n_control={result.n_control}, n_treatment={result.n_treatment}
@@ -476,6 +510,12 @@ class BiasEvaluationPipeline:
                     )
 
                     if ate_results:
+                        # Apply FDR correction across dimensions for this treatment comparison
+                        pvals = [r.p_value for r in ate_results]
+                        fdr_mask = fdr_bh(pvals, alpha=0.05)
+                        for result, is_significant in zip(ate_results, fdr_mask):
+                            result.fdr_significant = bool(is_significant)
+
                         print(f"\n>>> Comparing: {control_value} vs {treatment_value}")
                         for result in ate_results:
                             print(self.ate_calculator.interpret_result(result))

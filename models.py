@@ -60,3 +60,4 @@ class ATEResult(BaseModel):
     n_control: int  # Sample size control group
     n_treatment: int  # Sample size treatment group
     effect_size: float  # Cohen's d
+    fdr_significant: bool = False  # Passes FDR correction (Benjamini-Hochberg)
