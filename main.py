@@ -673,12 +673,20 @@ class BiasEvaluationPipeline:
         return all_ate_results
 
 
-def demo_real_time_evaluation(sample_size: int = 50):
+def demo_real_time_evaluation(
+    sample_size: int = 50,
+    treatment_groups_race: Optional[List[str]] = None,
+    treatment_groups_gender: Optional[List[str]] = None
+):
     """
     Demonstrate the real-time evaluation pipeline with a smaller sample.
 
+    Evaluates bias on BOTH race and gender using paired counterfactual design.
+
     Args:
-        sample_size: Number of variations to evaluate (default 50 for quick demo)
+        sample_size: Number of variations to evaluate per focal variable (default 50)
+        treatment_groups_race: Racial groups to compare against White control (default: all)
+        treatment_groups_gender: Gender groups to compare against man control (default: all)
     """
     print("\n" + "="*80)
     print("REAL-TIME BIAS EVALUATION DEMO")
@@ -718,21 +726,7 @@ def demo_real_time_evaluation(sample_size: int = 50):
         ]
     }
 
-    # Generate variations with paired design (focal_var="race")
-    print(f"\nGenerating variations with PAIRED design (focal_var='race')...")
     generator = TreatmentGenerator()
-    all_variations = generator.generate_variations(
-        template,
-        demographic_vars,
-        n_runs=1,
-        focal_var="race"  # Creates counterfactual pairs where only race varies
-    )
-
-    # Sample for demo
-    variations = generator.sample_variations(all_variations, sample_size, seed=42)
-    print(f"Sampled {len(variations)} variations for evaluation")
-
-    # Initialize pipeline
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
     judge_adapter = OpenAIAdapter(model="gpt-5-nano")
     pipeline = BiasEvaluationPipeline(
@@ -741,23 +735,107 @@ def demo_real_time_evaluation(sample_size: int = 50):
         batch_size=10
     )
 
-    # Run evaluation with real-time display
-    ate_results = pipeline.run_evaluation(
-        variations=variations,
-        treatment_var="race",
-        control_value="White",
-        treatment_values=["Black or African American", "East Asian", "Hispanic or Latino"]
+    all_results = {}
+
+    # ==================== PART 1: RACE BIAS EVALUATION ====================
+    print("\n" + "="*80)
+    print("PART 1: EVALUATING RACE BIAS (paired design)")
+    print("="*80)
+
+    # Generate race-focused variations (gender held constant within pairs)
+    print(f"\nGenerating variations with PAIRED design (focal_var='race')...")
+    race_variations = generator.generate_variations(
+        template,
+        demographic_vars,
+        n_runs=1,
+        focal_var="race"  # Gender constant within pairs, only race varies
     )
 
-    # Final summary
+    # Sample for demo
+    race_sample = generator.sample_variations(race_variations, sample_size, seed=42)
+    print(f"Sampled {len(race_sample)} variations for race evaluation")
+
+    # Default to all racial groups
+    if treatment_groups_race is None:
+        treatment_groups_race = [
+            "Black or African American",
+            "East Asian",
+            "South Asian",
+            "Southeast Asian",
+            "Hispanic or Latino",
+            "Native American or Alaska Native",
+            "Middle Eastern or North African",
+            "Pacific Islander or Native Hawaiian",
+            "Multiracial"
+        ]
+
+    print(f"Racial treatment groups: {len(treatment_groups_race)}")
+    print(f"  - {', '.join(treatment_groups_race[:3])}, ...")
+
+    # Run race evaluation
+    race_results = pipeline.run_evaluation(
+        variations=race_sample,
+        treatment_var="race",
+        control_value="White",
+        treatment_values=treatment_groups_race
+    )
+
+    all_results["race"] = race_results
+
+    # ==================== PART 2: GENDER BIAS EVALUATION ====================
+    print("\n" + "="*80)
+    print("PART 2: EVALUATING GENDER BIAS (paired design)")
+    print("="*80)
+
+    # Generate gender-focused variations (race held constant within pairs)
+    print(f"\nGenerating variations with PAIRED design (focal_var='gender')...")
+    gender_variations = generator.generate_variations(
+        template,
+        demographic_vars,
+        n_runs=1,
+        focal_var="gender"  # Race constant within pairs, only gender varies
+    )
+
+    # Sample for demo
+    gender_sample = generator.sample_variations(gender_variations, sample_size, seed=43)
+    print(f"Sampled {len(gender_sample)} variations for gender evaluation")
+
+    # Default to all gender groups
+    if treatment_groups_gender is None:
+        treatment_groups_gender = [
+            "woman",
+            "nonbinary person",
+            "transgender man",
+            "transgender woman",
+            "genderqueer person",
+            "agender person"
+        ]
+
+    print(f"Gender treatment groups: {len(treatment_groups_gender)}")
+    print(f"  - {', '.join(treatment_groups_gender[:3])}, ...")
+
+    # Run gender evaluation
+    gender_results = pipeline.run_evaluation(
+        variations=gender_sample,
+        treatment_var="gender",
+        control_value="man",
+        treatment_values=treatment_groups_gender
+    )
+
+    all_results["gender"] = gender_results
+
+    # ==================== FINAL SUMMARY ====================
     print("\n" + "="*80)
     print("EVALUATION COMPLETE")
     print("="*80)
-    print(f"Total variations processed: {len(variations)}")
-    print(f"Total comparisons: {len(ate_results)}")
-    print(f"Results saved in returned dictionary")
+    print(f"Total variations processed: {len(race_sample) + len(gender_sample)}")
+    print(f"Race comparisons: {len(race_results)}")
+    print(f"Gender comparisons: {len(gender_results)}")
+    print(f"\nResults structure:")
+    print(f"  - all_results['race'][<treatment_group>] = List[ATEResult]")
+    print(f"  - all_results['gender'][<treatment_group>] = List[ATEResult]")
 
-    return ate_results
+    return all_results
 
 
 def test_bias_judge(variations: List[PromptVariation]):
