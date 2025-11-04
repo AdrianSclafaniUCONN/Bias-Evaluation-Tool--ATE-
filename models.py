@@ -57,6 +57,7 @@ class ATEResult(BaseModel):
     std_error: float  # Standard error of the ATE
     confidence_interval_95: tuple[float, float]  # 95% CI
     p_value: float  # Statistical significance
+    t_statistic: float = 0.0  # t-statistic from t-test
     n_control: int = 0  # Sample size control group (unpaired only)
     n_treatment: int = 0  # Sample size treatment group (unpaired only)
     n_pairs: int = 0  # Number of matched pairs (paired only)
