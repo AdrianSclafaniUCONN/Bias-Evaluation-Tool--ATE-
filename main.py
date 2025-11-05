@@ -14,6 +14,8 @@ from collections import defaultdict
 import numpy as np
 from scipy import stats
 from openai import OpenAI, AsyncOpenAI
+from google import genai
+from google.genai import errors as genai_errors
 from dotenv import load_dotenv
 from models import ModelResponse, PromptVariation, BiasScore, ATEResult
 
@@ -214,6 +216,105 @@ class OpenAIAdapter:
                 await asyncio.sleep(0.5 * (2 ** attempt))
 
 
+class GeminiAdapter:
+    """Gemini API implementation for Gemma 3 models.
+
+    Note: Gemma 3 does NOT support JSON mode, so we don't use response_mime_type.
+    The judge prompts explicitly request JSON format, and we parse it from the text.
+    """
+
+    def __init__(
+        self,
+        model: str = "gemma-3-27b-it",
+        api_key: Optional[str] = None,
+        enforce_json: bool = False,  # Kept for API compatibility but ignored for Gemma
+        temperature: Optional[float] = None
+    ):
+        self.model = model
+        self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
+        self.enforce_json = enforce_json  # Not used for Gemma models
+        self.temperature = temperature  # None means use model default
+
+    def generate(self, prompt: str) -> str:
+        """
+        Generate a response using Gemini API with retry/backoff.
+
+        Args:
+            prompt: The prompt to send to the model
+
+        Returns:
+            Model response text
+        """
+        for attempt in range(3):
+            try:
+                config = {}
+                if self.temperature is not None:
+                    config["temperature"] = self.temperature
+                # Note: Gemma 3 does NOT support JSON mode
+                # We rely on the prompt asking for JSON format
+
+                response = self.client.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config if config else None
+                )
+                return response.text
+
+            except genai_errors.APIError as e:
+                if attempt == 2:  # Last attempt
+                    raise
+                # Exponential backoff: 0.5s, 1s, 2s
+                time.sleep(0.5 * (2 ** attempt))
+
+    async def generate_async(self, prompt: str) -> str:
+        """
+        Async version: Generate a response using Gemini API with retry/backoff.
+
+        Args:
+            prompt: The prompt to send to the model
+
+        Returns:
+            Model response text
+        """
+        for attempt in range(3):
+            try:
+                config = {}
+                if self.temperature is not None:
+                    config["temperature"] = self.temperature
+                # Note: Gemma 3 does NOT support JSON mode
+                # We rely on the prompt asking for JSON format
+
+                # Use client.aio directly without context manager
+                # The client manages its own lifecycle
+                response = await self.client.aio.models.generate_content(
+                    model=self.model,
+                    contents=prompt,
+                    config=config if config else None
+                )
+                return response.text
+
+            except genai_errors.ClientError as e:
+                # Handle rate limiting (429) with longer delays
+                if e.code == 429:
+                    # Extract retry delay from error message if available
+                    retry_delay = 35  # Default from error message
+                    if attempt < 2:
+                        print(f"\n⚠️  Rate limit hit, waiting {retry_delay}s...")
+                        await asyncio.sleep(retry_delay)
+                        continue
+                    else:
+                        raise
+                elif attempt == 2:
+                    raise
+                # Exponential backoff for other errors: 0.5s, 1s, 2s
+                await asyncio.sleep(0.5 * (2 ** attempt))
+            except genai_errors.APIError as e:
+                if attempt == 2:  # Last attempt
+                    raise
+                # Exponential backoff: 0.5s, 1s, 2s
+                await asyncio.sleep(0.5 * (2 ** attempt))
+
+
 class TreatmentGenerator:
     """Generates prompt variations by swapping demographic variables."""
 
@@ -361,40 +462,41 @@ class TreatmentGenerator:
 
 
 def create_perturbed_judges(
-    base_model: str = "gpt-5-nano",
+    base_model: str = "gemma-3-27b-it",
     n_judges: int = 3,
-    api_key: Optional[str] = None
+    api_key: Optional[str] = None,
+    use_gemini: bool = True
 ) -> List[ModelAdapter]:
     """
     Create multiple judge adapters for diversity.
 
-    For GPT-5 Nano (which doesn't support temperature), we simply create
-    multiple instances of the same model. The diversity comes from the
-    stochastic nature of the model itself.
-
-    For future extensibility with other models that support temperature,
-    this function can be enhanced to use temperature perturbations.
+    For both Gemma 3 and GPT-5 Nano, we create multiple instances of the
+    same model. The diversity comes from the stochastic nature of the models.
 
     Args:
-        base_model: The model to use for all judges (e.g., "gpt-5-nano")
+        base_model: The model to use for all judges (e.g., "gemma-3-27b-it", "gpt-5-nano")
         n_judges: Number of judges to create
-        api_key: Optional OpenAI API key
+        api_key: Optional API key (Gemini or OpenAI depending on use_gemini flag)
+        use_gemini: If True, use GeminiAdapter; if False, use OpenAIAdapter
 
     Returns:
         List of ModelAdapter instances configured for judging
     """
     judges = []
 
-    # GPT-5 Nano doesn't support custom temperature, so we create
-    # multiple instances with default settings. The model's inherent
-    # stochasticity provides diversity across runs.
     for _ in range(n_judges):
-        judges.append(OpenAIAdapter(
-            model=base_model,
-            api_key=api_key,
-            enforce_json=True
-            # No temperature parameter - GPT-5 Nano uses default
-        ))
+        if use_gemini:
+            judges.append(GeminiAdapter(
+                model=base_model,
+                api_key=api_key,
+                enforce_json=True
+            ))
+        else:
+            judges.append(OpenAIAdapter(
+                model=base_model,
+                api_key=api_key,
+                enforce_json=True
+            ))
 
     return judges
 
@@ -1294,7 +1396,7 @@ def demo_real_time_evaluation(
 
     generator = TreatmentGenerator()
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
-    judge_adapter = OpenAIAdapter(model="gpt-5-nano", enforce_json=True)  # JSON enforcement for judges
+    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True)  # Gemma 3 for judging
     pipeline = BiasEvaluationPipeline(
         model_adapter=model_adapter,
         judge_adapter=judge_adapter,
@@ -1492,7 +1594,7 @@ async def demo_real_time_evaluation_async(
 
     generator = TreatmentGenerator()
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
-    judge_adapter = OpenAIAdapter(model="gpt-5-nano", enforce_json=True)
+    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True)
     pipeline = BiasEvaluationPipeline(
         model_adapter=model_adapter,
         judge_adapter=judge_adapter,
@@ -1835,12 +1937,13 @@ def test_jury_adapter():
     print("\n=== Testing JuryAdapter (Judge Ensemble) ===")
 
     # Create a jury of 3 judges (diversity from model stochasticity)
-    print("\nCreating jury of 3 judges (using model stochasticity for diversity)...")
+    print("\nCreating jury of 3 Gemma 3 judges (using model stochasticity for diversity)...")
     judges = create_perturbed_judges(
-        base_model="gpt-5-nano",
-        n_judges=3
+        base_model="gemma-3-27b-it",
+        n_judges=3,
+        use_gemini=True
     )
-    print(f"✓ Created {len(judges)} judges")
+    print(f"✓ Created {len(judges)} Gemma 3 judges")
 
     # Create JuryAdapter
     jury_adapter = JuryAdapter(
