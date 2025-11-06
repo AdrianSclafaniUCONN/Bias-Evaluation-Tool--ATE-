@@ -155,18 +155,18 @@ def paired_effects(scores: List, treatment_var: str, control_value: str, treatme
     # Guard: Check for zero variance (all deltas identical)
     std = deltas.std(ddof=1)
     if std == 0 or not np.isfinite(std):
-        print(f"⚠️  Warning: Zero variance in deltas for {treatment_var}={treatment_value}. All pairs identical.")
-        # Can still report mean delta, but no meaningful SE/CI/t-test
+        print(f"⚠️  Warning: Zero variance in deltas for {treatment_var}={treatment_value}. All pairs identical; no inferential test performed.")
+        # Can report mean delta, but no meaningful SE/CI/t-test
         mean = float(deltas.mean())
         return {
             "mean_delta": mean,
             "se": 0.0,
             "ci95": (mean, mean),  # Degenerate CI
-            "t": float('inf') if mean != 0 else 0.0,  # t = mean/0 → inf (or 0 if mean=0)
-            "p": 0.0 if mean != 0 else 1.0,  # Perfect "effect" if non-zero mean with zero variance
+            "t": 0.0,  # No test statistic
+            "p": 1.0,  # Cannot reject null when no variance
             "n_pairs": int(len(deltas)),
-            "effect_size_dz": float('inf') if mean != 0 else 0.0,
-            "test_used": "none"  # No test used due to zero variance
+            "effect_size_dz": 0.0,  # No effect size when no variance
+            "test_used": "degenerate"  # Degenerate case (all deltas identical)
         }
 
     # Check for skewness to decide between t-test and Wilcoxon
@@ -180,8 +180,9 @@ def paired_effects(scores: List, treatment_var: str, control_value: str, treatme
         print(f"   ℹ️  Using Wilcoxon signed-rank test for {treatment_var}={treatment_value} (skewness={skewness:.2f})")
 
         # Wilcoxon test returns test statistic and p-value
+        # Use 'pratt' method to handle zeros more carefully (includes zero-differences in ranking)
         try:
-            wilcox_stat, p = stats.wilcoxon(deltas, alternative='two-sided')
+            wilcox_stat, p = stats.wilcoxon(deltas, alternative='two-sided', zero_method='pratt')
             test_stat = float(wilcox_stat)
             test_used = "wilcoxon"
         except ValueError as e:
@@ -567,7 +568,7 @@ def create_perturbed_judges(
     base_model: str = "gemma-3-27b-it",
     n_judges: int = 3,
     api_key: Optional[str] = None,
-    use_gemini: bool = True,
+    use_google: bool = True,
     temperature: float = 0.0
 ) -> List[ModelAdapter]:
     """
@@ -580,8 +581,8 @@ def create_perturbed_judges(
     Args:
         base_model: The model to use for all judges (e.g., "gemma-3-27b-it", "gpt-5-nano")
         n_judges: Number of judges to create
-        api_key: Optional API key (Gemini or OpenAI depending on use_gemini flag)
-        use_gemini: If True, use GeminiAdapter; if False, use OpenAIAdapter
+        api_key: Optional API key (Google or OpenAI depending on use_google flag)
+        use_google: If True, use GeminiAdapter (Google client); if False, use OpenAIAdapter
         temperature: Sampling temperature (default 0.0 for determinism)
 
     Returns:
@@ -590,7 +591,7 @@ def create_perturbed_judges(
     judges = []
 
     for _ in range(n_judges):
-        if use_gemini:
+        if use_google:
             judges.append(GeminiAdapter(
                 model=base_model,
                 api_key=api_key,
@@ -1211,7 +1212,7 @@ class BiasEvaluationPipeline:
         treatment_var: str,
         control_value: str,
         treatment_values: List[str]
-    ) -> Dict[str, List[ATEResult]]:
+    ) -> tuple[List[BiasScore], Dict[str, List[ATEResult]]]:
         """
         Run the full evaluation pipeline with real-time progress display.
 
@@ -1222,7 +1223,9 @@ class BiasEvaluationPipeline:
             treatment_values: List of treatment group values to compare against control
 
         Returns:
-            Dict mapping treatment values to their ATE results
+            Tuple of (all_scores, ate_results) where:
+            - all_scores: List of all BiasScore objects (row-level data)
+            - ate_results: Dict mapping treatment values to their ATE results
         """
         print(f"\n{'='*80}")
         print(f"BIAS EVALUATION PIPELINE - REAL-TIME RESULTS")
@@ -1293,7 +1296,7 @@ class BiasEvaluationPipeline:
 
                 print(f"{'─'*80}\n")
 
-        return all_ate_results
+        return all_scores, all_ate_results
 
     async def run_evaluation_async(
         self,
@@ -1302,7 +1305,7 @@ class BiasEvaluationPipeline:
         control_value: str,
         treatment_values: List[str],
         max_concurrent: int = 10
-    ) -> Dict[str, List[ATEResult]]:
+    ) -> tuple[List[BiasScore], Dict[str, List[ATEResult]]]:
         """
         ASYNC version: Run the full evaluation pipeline with parallel processing.
 
@@ -1317,7 +1320,9 @@ class BiasEvaluationPipeline:
             max_concurrent: Maximum number of concurrent API calls (default 10)
 
         Returns:
-            Dict mapping treatment values to their ATE results
+            Tuple of (all_scores, ate_results) where:
+            - all_scores: List of all BiasScore objects (row-level data)
+            - ate_results: Dict mapping treatment values to their ATE results
         """
         print(f"\n{'='*80}")
         print(f"BIAS EVALUATION PIPELINE - ASYNC PARALLEL MODE")
@@ -1385,7 +1390,7 @@ class BiasEvaluationPipeline:
 
                 print(f"{'─'*80}\n")
 
-        return all_ate_results
+        return all_scores, all_ate_results
 
     async def _process_single_variation_async(
         self,
@@ -1550,7 +1555,7 @@ def demo_real_time_evaluation(
     print(f"  - {', '.join(treatment_groups_race[:3])}, ...")
 
     # Run race evaluation
-    race_results = pipeline.run_evaluation(
+    race_scores, race_results = pipeline.run_evaluation(
         variations=race_sample,
         treatment_var="race",
         control_value="White",
@@ -1607,7 +1612,7 @@ def demo_real_time_evaluation(
     print(f"  - {', '.join(treatment_groups_gender[:3])}, ...")
 
     # Run gender evaluation
-    gender_results = pipeline.run_evaluation(
+    gender_scores, gender_results = pipeline.run_evaluation(
         variations=gender_sample,
         treatment_var="gender",
         control_value="man",
@@ -1748,7 +1753,7 @@ async def demo_real_time_evaluation_async(
     print(f"  - {', '.join(treatment_groups_race[:3])}, ...")
 
     # Run race evaluation ASYNC
-    race_results = await pipeline.run_evaluation_async(
+    race_scores, race_results = await pipeline.run_evaluation_async(
         variations=race_sample,
         treatment_var="race",
         control_value="White",
@@ -1802,7 +1807,7 @@ async def demo_real_time_evaluation_async(
     print(f"  - {', '.join(treatment_groups_gender[:3])}, ...")
 
     # Run gender evaluation ASYNC
-    gender_results = await pipeline.run_evaluation_async(
+    gender_scores, gender_results = await pipeline.run_evaluation_async(
         variations=gender_sample,
         treatment_var="gender",
         control_value="man",
@@ -1885,7 +1890,10 @@ def display_results_table(results: Dict[str, List[ATEResult]], focal_var: str):
         ci = f"[{result.confidence_interval_95[0]:+.2f}, {result.confidence_interval_95[1]:+.2f}]"
         t_stat = f"{result.t_statistic:.2f}" if hasattr(result, 't_statistic') else "N/A"
         p_val = f"{result.p_value:.4f}" if result.p_value >= 0.0001 else "<.0001"
-        q_val = f"{result.q_value:.4f}" if result.q_value >= 0.0001 else "<.0001"
+
+        # Safe attribute access for q_value and fdr_significant (may not exist in older results)
+        q_value = getattr(result, "q_value", float("nan"))
+        q_val = f"{q_value:.4f}" if (not np.isnan(q_value) and q_value >= 0.0001) else ("<.0001" if not np.isnan(q_value) else "N/A")
         fdr_flag = getattr(result, "fdr_significant", False)
         fdr = "Yes" if fdr_flag else "No"
 
@@ -2196,7 +2204,7 @@ def test_jury_adapter():
     judges = create_perturbed_judges(
         base_model="gemma-3-27b-it",
         n_judges=3,
-        use_gemini=True
+        use_google=True
     )
     print(f"✓ Created {len(judges)} Gemma 3 judges")
 
