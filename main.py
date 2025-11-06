@@ -8,6 +8,9 @@ import uuid
 import time
 import hashlib
 import asyncio
+import csv
+from datetime import datetime
+from pathlib import Path
 from typing import Protocol, Optional, Dict, List
 from itertools import product
 from collections import defaultdict
@@ -17,7 +20,7 @@ from openai import OpenAI, AsyncOpenAI
 from google import genai
 from google.genai import errors as genai_errors
 from dotenv import load_dotenv
-from models import ModelResponse, PromptVariation, BiasScore, ATEResult
+from models import ModelResponse, PromptVariation, BiasScore, ATEResult, JudgeOutput
 
 # Load environment variables
 load_dotenv()
@@ -52,7 +55,49 @@ def fdr_bh(pvals: List[float], alpha: float = 0.05) -> np.ndarray:
     return passed
 
 
-def paired_effects(scores: List, treatment_var: str, control_value: str, treatment_value: str) -> Dict:
+def bh_qvalues(pvals: List[float]) -> np.ndarray:
+    """
+    Compute Benjamini-Hochberg q-values (adjusted p-values).
+
+    The q-value is the minimum FDR at which a test would be significant.
+    It's the adjusted p-value that accounts for multiple testing.
+
+    Args:
+        pvals: List of p-values
+
+    Returns:
+        Array of q-values (same length as pvals, in original order)
+    """
+    p = np.asarray(pvals)
+    m = len(p)
+
+    if m == 0:
+        return np.array([])
+
+    # Sort p-values and track original indices
+    order = np.argsort(p)
+    ranked = p[order]
+
+    # Compute q-values: q(i) = min(p(i) * m / i, q(i+1))
+    # Start from largest p-value and work backwards
+    qvals_sorted = np.zeros(m)
+    qvals_sorted[-1] = ranked[-1]  # Largest p-value's q-value is itself
+
+    for i in range(m - 2, -1, -1):
+        # q(i) = min(p(i) * m / (i+1), q(i+1))
+        qvals_sorted[i] = min(ranked[i] * m / (i + 1), qvals_sorted[i + 1])
+
+    # Restore original order
+    qvals = np.zeros(m)
+    qvals[order] = qvals_sorted
+
+    # Cap at 1.0 (can't have q-value > 1)
+    qvals = np.minimum(qvals, 1.0)
+
+    return qvals
+
+
+def paired_effects(scores: List, treatment_var: str, control_value: str, treatment_value: str, use_wilcoxon_fallback: bool = True) -> Dict:
     """
     Calculate paired treatment effects using within-pair deltas.
 
@@ -66,9 +111,10 @@ def paired_effects(scores: List, treatment_var: str, control_value: str, treatme
         treatment_var: Variable being tested (e.g., "race")
         control_value: Control group value (e.g., "White")
         treatment_value: Treatment group value (e.g., "Black or African American")
+        use_wilcoxon_fallback: If True, use Wilcoxon test for highly skewed data (default: True)
 
     Returns:
-        Dict with mean_delta, se, ci95, t, p, n_pairs, effect_size_dz
+        Dict with mean_delta, se, ci95, t/z, p, n_pairs, effect_size_dz, test_used
     """
     from collections import defaultdict
 
@@ -94,28 +140,82 @@ def paired_effects(scores: List, treatment_var: str, control_value: str, treatme
 
     deltas = np.asarray(deltas)
 
-    # One-sample t-test on deltas (H0: μΔ = 0)
-    t, p = stats.ttest_1samp(deltas, 0.0)
+    # Guard: Check for NaN or inf in deltas (data quality issue)
+    if not np.all(np.isfinite(deltas)):
+        print(f"⚠️  Warning: Non-finite values detected in deltas for {treatment_var}={treatment_value}")
+        deltas = deltas[np.isfinite(deltas)]  # Filter out NaN/inf
+        if len(deltas) == 0:
+            return None
+
+    # Guard: Need at least 2 pairs for valid t-test and SE calculation
+    if len(deltas) < 2:
+        print(f"⚠️  Warning: Only {len(deltas)} pair(s) found for {treatment_var}={treatment_value}. Need ≥2 for t-test.")
+        return None
+
+    # Guard: Check for zero variance (all deltas identical)
+    std = deltas.std(ddof=1)
+    if std == 0 or not np.isfinite(std):
+        print(f"⚠️  Warning: Zero variance in deltas for {treatment_var}={treatment_value}. All pairs identical.")
+        # Can still report mean delta, but no meaningful SE/CI/t-test
+        mean = float(deltas.mean())
+        return {
+            "mean_delta": mean,
+            "se": 0.0,
+            "ci95": (mean, mean),  # Degenerate CI
+            "t": float('inf') if mean != 0 else 0.0,  # t = mean/0 → inf (or 0 if mean=0)
+            "p": 0.0 if mean != 0 else 1.0,  # Perfect "effect" if non-zero mean with zero variance
+            "n_pairs": int(len(deltas)),
+            "effect_size_dz": float('inf') if mean != 0 else 0.0,
+            "test_used": "none"  # No test used due to zero variance
+        }
+
+    # Check for skewness to decide between t-test and Wilcoxon
+    # Skewness > 2 or < -2 indicates highly skewed data
+    skewness = stats.skew(deltas)
+    use_wilcoxon = use_wilcoxon_fallback and (abs(skewness) > 2 or len(deltas) < 15)
+
+    if use_wilcoxon:
+        # Wilcoxon signed-rank test (non-parametric alternative to paired t-test)
+        # More robust to outliers and non-normal distributions
+        print(f"   ℹ️  Using Wilcoxon signed-rank test for {treatment_var}={treatment_value} (skewness={skewness:.2f})")
+
+        # Wilcoxon test returns test statistic and p-value
+        try:
+            wilcox_stat, p = stats.wilcoxon(deltas, alternative='two-sided')
+            test_stat = float(wilcox_stat)
+            test_used = "wilcoxon"
+        except ValueError as e:
+            # Fallback if Wilcoxon fails (e.g., all zeros)
+            print(f"   ⚠️  Wilcoxon test failed, using t-test: {e}")
+            test_stat, p = stats.ttest_1samp(deltas, 0.0)
+            test_stat = float(test_stat)
+            test_used = "ttest"
+    else:
+        # Standard paired t-test
+        test_stat, p = stats.ttest_1samp(deltas, 0.0)
+        test_stat = float(test_stat)
+        test_used = "ttest"
 
     mean = float(deltas.mean())
-    se = float(deltas.std(ddof=1) / np.sqrt(len(deltas)))
+    se = float(std / np.sqrt(len(deltas)))
 
-    # Use Student's t critical value (not z=1.96)
+    # Use Student's t critical value (not z=1.96) for CI
     df = len(deltas) - 1
     t_crit = stats.t.ppf(0.975, df)
     ci = (mean - t_crit * se, mean + t_crit * se)
 
     # Cohen's dz for paired design (effect size)
-    dz = mean / deltas.std(ddof=1) if deltas.std(ddof=1) > 0 else 0.0
+    dz = mean / std
 
     return {
         "mean_delta": mean,
         "se": se,
         "ci95": ci,
-        "t": float(t),
+        "t": test_stat,  # t-statistic (t-test) or W-statistic (Wilcoxon)
         "p": float(p),
         "n_pairs": int(len(deltas)),
-        "effect_size_dz": float(dz)
+        "effect_size_dz": float(dz),
+        "test_used": test_used  # "ttest" or "wilcoxon"
     }
 
 
@@ -219,20 +319,21 @@ class OpenAIAdapter:
 class GeminiAdapter:
     """Gemini API implementation for Gemma 3 models.
 
-    Note: Gemma 3 does NOT support JSON mode, so we don't use response_mime_type.
-    The judge prompts explicitly request JSON format, and we parse it from the text.
+    Note: Gemma 3 models do NOT support JSON mode (response_json_schema).
+    JSON mode is only available for Gemini models (e.g., gemini-2.5-flash), not Gemma.
+    We rely on the judge prompts explicitly requesting JSON format and parse it from text.
     """
 
     def __init__(
         self,
         model: str = "gemma-3-27b-it",
         api_key: Optional[str] = None,
-        enforce_json: bool = False,  # Kept for API compatibility but ignored for Gemma
+        enforce_json: bool = False,  # Kept for API compatibility but not used for Gemma
         temperature: Optional[float] = None
     ):
         self.model = model
         self.client = genai.Client(api_key=api_key or os.getenv("GEMINI_API_KEY"))
-        self.enforce_json = enforce_json  # Not used for Gemma models
+        self.enforce_json = enforce_json  # Not used for Gemma models (no JSON mode support)
         self.temperature = temperature  # None means use model default
 
     def generate(self, prompt: str) -> str:
@@ -358,23 +459,24 @@ class TreatmentGenerator:
                 pair_key = tuple((k, v) for k, v in sorted(treatments.items()) if k != focal_var)
                 # Use hashlib for deterministic cross-process hashing
                 pair_id = f"pair_{hashlib.sha1(repr(pair_key).encode()).hexdigest()[:12]}"
-
-                # Lock a name per pair_id to prevent name leakage between counterfactuals
-                if names:
-                    rng = random.Random(pair_id)  # deterministic per pair
-                    locked_name = rng.choice(names)
             else:
                 # Legacy: all variations share one pair_id if no focal_var specified
                 pair_id = f"pair_{uuid.uuid4().hex[:12]}"
-                locked_name = None
 
             # For each treatment combination, run n times
             for run in range(n_runs):
                 t = treatments.copy()
 
-                # Assign name: locked for paired design, random for unpaired
+                # Assign name: use neutral name for paired design to avoid demographic contradictions
+                # (e.g., "Mei Chen, a Black man" creates confounding cues that undermine causal inference)
+                # For unpaired designs, randomly assign from demographic-specific name list
                 if names:
-                    t["name"] = locked_name if focal_var else random.choice(names)
+                    if focal_var:
+                        # Use neutral name "Alex" for all paired variations to prevent name-demographic conflicts
+                        t["name"] = "Alex"
+                    else:
+                        # Unpaired design: randomly select from demographic-specific name list
+                        t["name"] = random.choice(names)
 
                 filled_prompt = template.format(**t)
 
@@ -465,19 +567,22 @@ def create_perturbed_judges(
     base_model: str = "gemma-3-27b-it",
     n_judges: int = 3,
     api_key: Optional[str] = None,
-    use_gemini: bool = True
+    use_gemini: bool = True,
+    temperature: float = 0.0
 ) -> List[ModelAdapter]:
     """
     Create multiple judge adapters for diversity.
 
     For both Gemma 3 and GPT-5 Nano, we create multiple instances of the
-    same model. The diversity comes from the stochastic nature of the models.
+    same model. With temperature=0, the models are deterministic (same prompt → same output).
+    Diversity comes from slight variations in judge prompts or repeated sampling.
 
     Args:
         base_model: The model to use for all judges (e.g., "gemma-3-27b-it", "gpt-5-nano")
         n_judges: Number of judges to create
         api_key: Optional API key (Gemini or OpenAI depending on use_gemini flag)
         use_gemini: If True, use GeminiAdapter; if False, use OpenAIAdapter
+        temperature: Sampling temperature (default 0.0 for determinism)
 
     Returns:
         List of ModelAdapter instances configured for judging
@@ -489,13 +594,15 @@ def create_perturbed_judges(
             judges.append(GeminiAdapter(
                 model=base_model,
                 api_key=api_key,
-                enforce_json=True
+                enforce_json=True,
+                temperature=temperature
             ))
         else:
             judges.append(OpenAIAdapter(
                 model=base_model,
                 api_key=api_key,
-                enforce_json=True
+                enforce_json=True,
+                temperature=temperature
             ))
 
     return judges
@@ -1396,7 +1503,7 @@ def demo_real_time_evaluation(
 
     generator = TreatmentGenerator()
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
-    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True)  # Gemma 3 for judging
+    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True, temperature=0.0)  # Gemma 3 for judging
     pipeline = BiasEvaluationPipeline(
         model_adapter=model_adapter,
         judge_adapter=judge_adapter,
@@ -1458,8 +1565,10 @@ def demo_real_time_evaluation(
     if all_race_results_flat:
         pvals = [r.p_value for r in all_race_results_flat]
         fdr_mask = fdr_bh(pvals, alpha=0.05)
-        for result, is_significant in zip(all_race_results_flat, fdr_mask):
+        qvals = bh_qvalues(pvals)
+        for result, is_significant, qval in zip(all_race_results_flat, fdr_mask, qvals):
             result.fdr_significant = bool(is_significant)
+            result.q_value = float(qval)
 
     all_results["race"] = race_results
 
@@ -1513,8 +1622,10 @@ def demo_real_time_evaluation(
     if all_gender_results_flat:
         pvals = [r.p_value for r in all_gender_results_flat]
         fdr_mask = fdr_bh(pvals, alpha=0.05)
-        for result, is_significant in zip(all_gender_results_flat, fdr_mask):
+        qvals = bh_qvalues(pvals)
+        for result, is_significant, qval in zip(all_gender_results_flat, fdr_mask, qvals):
             result.fdr_significant = bool(is_significant)
+            result.q_value = float(qval)
 
     all_results["gender"] = gender_results
 
@@ -1594,7 +1705,7 @@ async def demo_real_time_evaluation_async(
 
     generator = TreatmentGenerator()
     model_adapter = OpenAIAdapter(model="gpt-5-nano")
-    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True)
+    judge_adapter = GeminiAdapter(model="gemma-3-27b-it", enforce_json=True, temperature=0.0)
     pipeline = BiasEvaluationPipeline(
         model_adapter=model_adapter,
         judge_adapter=judge_adapter,
@@ -1653,8 +1764,10 @@ async def demo_real_time_evaluation_async(
     if all_race_results_flat:
         pvals = [r.p_value for r in all_race_results_flat]
         fdr_mask = fdr_bh(pvals, alpha=0.05)
-        for result, is_significant in zip(all_race_results_flat, fdr_mask):
+        qvals = bh_qvalues(pvals)
+        for result, is_significant, qval in zip(all_race_results_flat, fdr_mask, qvals):
             result.fdr_significant = bool(is_significant)
+            result.q_value = float(qval)
 
     all_results["race"] = race_results
 
@@ -1705,8 +1818,10 @@ async def demo_real_time_evaluation_async(
     if all_gender_results_flat:
         pvals = [r.p_value for r in all_gender_results_flat]
         fdr_mask = fdr_bh(pvals, alpha=0.05)
-        for result, is_significant in zip(all_gender_results_flat, fdr_mask):
+        qvals = bh_qvalues(pvals)
+        for result, is_significant, qval in zip(all_gender_results_flat, fdr_mask, qvals):
             result.fdr_significant = bool(is_significant)
+            result.q_value = float(qval)
 
     all_results["gender"] = gender_results
 
@@ -1733,17 +1848,17 @@ def display_results_table(results: Dict[str, List[ATEResult]], focal_var: str):
         results: Dict mapping treatment_group -> List[ATEResult]
         focal_var: "race" or "gender"
     """
-    print("\n" + "="*120)
+    print("\n" + "="*130)
     print(f"FORMAL RESULTS TABLE: {focal_var.upper()} BIAS EVALUATION")
-    print("="*120)
+    print("="*130)
     print("\nPaired (preferred) / Welch-unpaired (fallback) with BH-FDR correction")
     print("Scale: 0-50 where 0=no bias detected, 50=severe bias")
-    print("-"*120)
+    print("-"*130)
 
     # Table header
-    header = f"{'Comparison':<40} {'Dimension':<30} {'Mean Δ':<10} {'SE':<8} {'95% CI':<22} {'t':<8} {'p':<10} {'FDR':<8} {'dz/d':<8} {'n (pairs or n1|n0)':<20}"
+    header = f"{'Comparison':<40} {'Dimension':<30} {'Mean Δ':<10} {'SE':<8} {'95% CI':<22} {'t':<8} {'p':<10} {'q':<10} {'FDR':<8} {'dz/d':<8} {'n':<10}"
     print(header)
-    print("-"*120)
+    print("-"*130)
 
     # Collect all results for sorting
     all_rows = []
@@ -1760,7 +1875,7 @@ def display_results_table(results: Dict[str, List[ATEResult]], focal_var: str):
         # Add spacing between treatment groups
         if current_treatment != treatment_group:
             if current_treatment is not None:
-                print("-"*120)
+                print("-"*130)
             current_treatment = treatment_group
 
         comparison = f"{result.control_value} vs {result.treatment_value}"
@@ -1770,6 +1885,7 @@ def display_results_table(results: Dict[str, List[ATEResult]], focal_var: str):
         ci = f"[{result.confidence_interval_95[0]:+.2f}, {result.confidence_interval_95[1]:+.2f}]"
         t_stat = f"{result.t_statistic:.2f}" if hasattr(result, 't_statistic') else "N/A"
         p_val = f"{result.p_value:.4f}" if result.p_value >= 0.0001 else "<.0001"
+        q_val = f"{result.q_value:.4f}" if result.q_value >= 0.0001 else "<.0001"
         fdr_flag = getattr(result, "fdr_significant", False)
         fdr = "Yes" if fdr_flag else "No"
 
@@ -1779,23 +1895,162 @@ def display_results_table(results: Dict[str, List[ATEResult]], focal_var: str):
         n_val = (str(result.n_pairs) if result.analysis_type == "paired"
                  else f"{result.n_treatment}|{result.n_control}")
 
-        row = f"{comparison:<40} {dimension:<30} {mean_delta:<10} {se:<8} {ci:<22} {t_stat:<8} {p_val:<10} {fdr:<8} {eff_val:<8} {n_val:<20}"
+        row = f"{comparison:<40} {dimension:<30} {mean_delta:<10} {se:<8} {ci:<22} {t_stat:<8} {p_val:<10} {q_val:<10} {fdr:<8} {eff_val:<8} {n_val:<10}"
         print(row)
 
-    print("="*120)
+    print("="*130)
     print("\nLegend:")
     print("  Mean Δ = Average treatment effect (within-pair difference: treatment - control)")
     print("  SE = Standard error of the mean difference")
     print("  95% CI = 95% confidence interval for Mean Δ")
     print("  t = t-statistic from paired t-test")
     print("  p = p-value (two-tailed)")
-    print("  FDR = Significant after FDR correction (α=0.05)")
+    print("  q = q-value (FDR-adjusted p-value via Benjamini-Hochberg)")
+    print("  FDR = Significant after FDR correction at α=0.05 (q < 0.05)")
     print("  dz = Cohen's dz effect size (paired design)")
     print("  n = Number of matched pairs")
     print("\nEffect size interpretation (|dz|): <0.2 negligible, 0.2-0.5 small, 0.5-0.8 medium, >0.8 large")
     print("Positive Mean Δ = Higher bias scores for treatment group (more bias detected)")
     print("Negative Mean Δ = Lower bias scores for treatment group (less bias detected)")
-    print("="*120 + "\n")
+    print("q-value interpretation: The minimum FDR at which this result would be significant")
+    print("="*130 + "\n")
+
+
+def export_results(
+    all_scores: List[BiasScore],
+    ate_results: Dict[str, List[ATEResult]],
+    output_dir: str = "./results",
+    run_id: Optional[str] = None,
+    metadata: Optional[Dict] = None
+):
+    """
+    Export evaluation results to machine-readable formats (CSV + JSON).
+
+    Args:
+        all_scores: List of all BiasScore objects (row-level data)
+        ate_results: Dict mapping treatment_group -> List[ATEResult] (summary statistics)
+        output_dir: Directory to save results (default: ./results)
+        run_id: Optional run identifier (default: timestamp)
+        metadata: Optional metadata dict (model versions, configs, etc.)
+    """
+    # Create output directory
+    output_path = Path(output_dir)
+    output_path.mkdir(parents=True, exist_ok=True)
+
+    # Generate run_id if not provided
+    if run_id is None:
+        run_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    print(f"\n📁 Exporting results to: {output_path.absolute()}")
+    print(f"   Run ID: {run_id}")
+
+    # 1. Export row-level scores to CSV
+    scores_csv = output_path / f"bias_scores_{run_id}.csv"
+    with open(scores_csv, 'w', newline='', encoding='utf-8') as f:
+        if all_scores:
+            writer = csv.DictWriter(f, fieldnames=[
+                'score_id', 'response_id', 'pair_id', 'dimension', 'score',
+                'race', 'gender', 'name', 'reasoning'
+            ])
+            writer.writeheader()
+
+            for score in all_scores:
+                writer.writerow({
+                    'score_id': score.score_id,
+                    'response_id': score.response_id,
+                    'pair_id': score.pair_id,
+                    'dimension': score.dimension,
+                    'score': score.score,
+                    'race': score.treatments.get('race', ''),
+                    'gender': score.treatments.get('gender', ''),
+                    'name': score.treatments.get('name', ''),
+                    'reasoning': score.reasoning[:200]  # Truncate for CSV
+                })
+
+    print(f"   ✓ Saved row-level scores: {scores_csv.name} ({len(all_scores)} rows)")
+
+    # 2. Export ATE results summary to CSV
+    ate_csv = output_path / f"ate_results_{run_id}.csv"
+    with open(ate_csv, 'w', newline='', encoding='utf-8') as f:
+        fieldnames = [
+            'treatment_var', 'control_value', 'treatment_value', 'dimension',
+            'ate', 'std_error', 'ci_lower', 'ci_upper', 't_statistic', 'p_value', 'q_value',
+            'fdr_significant', 'effect_size', 'n_pairs', 'n_control', 'n_treatment', 'analysis_type'
+        ]
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer.writeheader()
+
+        n_results = 0
+        for treatment_group, results in ate_results.items():
+            for result in results:
+                writer.writerow({
+                    'treatment_var': result.treatment_var,
+                    'control_value': result.control_value,
+                    'treatment_value': result.treatment_value,
+                    'dimension': result.dimension,
+                    'ate': result.ate,
+                    'std_error': result.std_error,
+                    'ci_lower': result.confidence_interval_95[0],
+                    'ci_upper': result.confidence_interval_95[1],
+                    't_statistic': result.t_statistic,
+                    'p_value': result.p_value,
+                    'q_value': result.q_value,
+                    'fdr_significant': result.fdr_significant,
+                    'effect_size': result.effect_size,
+                    'n_pairs': result.n_pairs,
+                    'n_control': result.n_control,
+                    'n_treatment': result.n_treatment,
+                    'analysis_type': result.analysis_type
+                })
+                n_results += 1
+
+    print(f"   ✓ Saved ATE summary: {ate_csv.name} ({n_results} comparisons)")
+
+    # 3. Export full results + metadata to JSON
+    json_output = output_path / f"full_results_{run_id}.json"
+
+    # Convert ATE results to dict format
+    ate_dict = {}
+    for treatment_group, results in ate_results.items():
+        ate_dict[treatment_group] = [r.model_dump() for r in results]
+
+    # Build full JSON structure
+    json_data = {
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "metadata": metadata or {},
+        "ate_results": ate_dict,
+        "row_level_scores": [s.model_dump() for s in all_scores] if len(all_scores) < 10000 else f"Too large ({len(all_scores)} rows), see CSV"
+    }
+
+    with open(json_output, 'w', encoding='utf-8') as f:
+        json.dump(json_data, f, indent=2, default=str)
+
+    print(f"   ✓ Saved full results + metadata: {json_output.name}")
+
+    # 4. Export metadata separately for easy inspection
+    metadata_json = output_path / f"metadata_{run_id}.json"
+    metadata_full = {
+        "run_id": run_id,
+        "timestamp": datetime.now().isoformat(),
+        "n_scores": len(all_scores),
+        "n_ate_comparisons": sum(len(results) for results in ate_results.values()),
+        "treatment_groups": list(ate_results.keys()),
+        **(metadata or {})
+    }
+
+    with open(metadata_json, 'w', encoding='utf-8') as f:
+        json.dump(metadata_full, f, indent=2, default=str)
+
+    print(f"   ✓ Saved metadata: {metadata_json.name}")
+    print(f"\n✅ Export complete! Files saved to: {output_path.absolute()}\n")
+
+    return {
+        "scores_csv": str(scores_csv),
+        "ate_csv": str(ate_csv),
+        "json_output": str(json_output),
+        "metadata_json": str(metadata_json)
+    }
 
 
 def test_bias_judge(variations: List[PromptVariation]):

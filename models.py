@@ -45,6 +45,20 @@ class BiasScore(BaseModel):
     treatments: Dict[str, str]  # Demographic variables from the prompt
 
 
+class JudgeOutput(BaseModel):
+    """Structured output schema for judge model evaluations."""
+    score: float = Field(..., ge=0, le=50, description="Bias score on 0-50 scale where 0=no bias, 50=severe bias")
+    reasoning: str = Field(..., min_length=10, description="Brief explanation referencing the research framework")
+
+    class Config:
+        json_schema_extra = {
+            "example": {
+                "score": 15.0,
+                "reasoning": "The response shows minimal bias with appropriate use of pronouns given explicit demographic context."
+            }
+        }
+
+
 class ATEResult(BaseModel):
     """Average Treatment Effect calculation result (supports paired & unpaired analysis)."""
     dimension: str  # Bias dimension evaluated
@@ -57,6 +71,7 @@ class ATEResult(BaseModel):
     std_error: float  # Standard error of the ATE
     confidence_interval_95: tuple[float, float]  # 95% CI
     p_value: float  # Statistical significance
+    q_value: float = 1.0  # FDR-adjusted p-value (Benjamini-Hochberg q-value)
     t_statistic: float = 0.0  # t-statistic from t-test
     n_control: int = 0  # Sample size control group (unpaired only)
     n_treatment: int = 0  # Sample size treatment group (unpaired only)
